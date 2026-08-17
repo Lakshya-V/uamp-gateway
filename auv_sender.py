@@ -3,44 +3,31 @@ auv_sender.py
 -------------
 Simulates the underwater vehicle (AUV) side of the link.
 
-- Fires TELEMETRY frames continuously (fast, loss-tolerant, no ACK expected).
-- Periodically fires COMMAND frames that MUST be acknowledged; if no ACK
-  arrives within TIMEOUT seconds, the frame is retransmitted (up to
-  MAX_RETRIES times).
-- PACKET_LOSS_RATE simulates a noisy underwater/acoustic link by randomly
-  "dropping" outgoing command frames before they ever leave the socket —
-  this proves the retransmission logic actually works, since the gateway
-  never even sees the dropped attempt.
+- Fires TELEMETRY frames continuously over UDP (fast, loss-tolerant).
+- Periodically fires COMMAND frames requiring ACKs (with retransmissions).
+- Simulates packet loss using PACKET_LOSS_RATE.
 """
 
 import socket
 import threading
 import time
+import json
 import random
 
-from uamp_protocol import (
-    pack_frame,
-    unpack_frame,
-    TYPE_TELEMETRY,
-    TYPE_COMMAND,
-    TYPE_ACK,
-    ChecksumMismatchError,
-    InvalidMagicError,
-)
+import uamp_protocol as uamp
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
 GATEWAY_HOST = "127.0.0.1"
-GATEWAY_PORT = 5050
+GATEWAY_PORT = 5000  # Matches surface_gateway.py port
 
-TELEMETRY_INTERVAL = 0.5      # seconds between telemetry frames
-COMMAND_INTERVAL = 4.0        # seconds between command attempts
-ACK_TIMEOUT = 1.0             # seconds to wait for an ACK before retrying
+TELEMETRY_INTERVAL = 0.5   # Seconds between telemetry frames
+COMMAND_INTERVAL = 4.0     # Seconds between command attempts
+ACK_TIMEOUT = 1.0          # Seconds to wait for an ACK
 MAX_RETRIES = 4
 
-PACKET_LOSS_RATE = 0.15       # simulated link loss for command frames
+PACKET_LOSS_RATE = 0.15    # 15% simulated acoustic link loss
 
 COMMANDS = [
     "GOTO_WAYPOINT",
@@ -53,11 +40,13 @@ _running = True
 
 
 # ---------------------------------------------------------------------------
-# Telemetry thread — fire and forget, UDP-style, loss-tolerant
+# Telemetry Loop — Fire-and-forget UDP
 # ---------------------------------------------------------------------------
-
-def telemetry_loop(sock: socket.socket):
+def telemetry_loop():
+    # Separate socket for telemetry to avoid socket lock contention
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     seq = 0
+    
     while _running:
         reading = {
             "depth": round(random.uniform(5.0, 60.0), 2),
@@ -65,68 +54,79 @@ def telemetry_loop(sock: socket.socket):
             "roll": round(random.uniform(-15.0, 15.0), 2),
             "sonar": round(random.uniform(0.5, 30.0), 2),
         }
-        frame = pack_frame(TYPE_TELEMETRY, seq, reading)
+        
+        # Serialize JSON payload to binary bytes
+        payload_bytes = json.dumps(reading).encode('utf-8')
+        frame = uamp.create_packet(uamp.TYPE_TELEMETRY, seq, payload_bytes)
+        
         sock.sendto(frame, (GATEWAY_HOST, GATEWAY_PORT))
         print(f"[TELEMETRY] seq={seq:04d} sent -> {reading}")
+        
         seq += 1
         time.sleep(TELEMETRY_INTERVAL)
+        
+    sock.close()
 
 
 # ---------------------------------------------------------------------------
-# Command thread — reliable channel with ACK + retransmission
+# Command Loop — Reliable Channel (ACK + Retransmission)
 # ---------------------------------------------------------------------------
-
-def command_loop(sock: socket.socket):
-    seq = 100000  # separate sequence space from telemetry, easy to spot in logs
+def command_loop():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    seq = 100000  # Offset sequence space for commands
     cmd_index = 0
 
     while _running:
         cmd_name = COMMANDS[cmd_index % len(COMMANDS)]
         cmd_index += 1
-        payload = {"cmd": cmd_name, "issued_at": time.time()}
-        frame = pack_frame(TYPE_COMMAND, seq, payload)
+        
+        payload_data = {"cmd": cmd_name, "issued_at": time.time()}
+        payload_bytes = json.dumps(payload_data).encode('utf-8')
+        frame = uamp.create_packet(uamp.TYPE_COMMAND, seq, payload_bytes)
 
         acked = False
         for attempt in range(1, MAX_RETRIES + 1):
+            # Simulate link loss by skipping transmission
             if random.random() < PACKET_LOSS_RATE:
-                print(f"[COMMAND ] seq={seq} '{cmd_name}' attempt {attempt} "
-                      f"LOST IN TRANSIT (simulated link loss)")
+                print(f"[COMMAND  ] seq={seq} '{cmd_name}' attempt {attempt} "
+                      f"LOST IN TRANSIT (Simulated Loss)")
             else:
                 sock.sendto(frame, (GATEWAY_HOST, GATEWAY_PORT))
-                print(f"[COMMAND ] seq={seq} '{cmd_name}' attempt {attempt} sent")
+                print(f"[COMMAND  ] seq={seq} '{cmd_name}' attempt {attempt} sent")
 
             sock.settimeout(ACK_TIMEOUT)
             try:
                 data, _addr = sock.recvfrom(2048)
-                parsed = unpack_frame(data)
-                if parsed["type"] == TYPE_ACK and parsed["seq"] == seq:
-                    print(f"[ACK     ] seq={seq} confirmed by gateway "
+                msg_type, rec_seq, ack_payload, is_valid = uamp.parse_packet(data)
+                
+                # Check for valid ACK matching our command sequence
+                if is_valid and msg_type == uamp.TYPE_ACK and rec_seq == seq:
+                    print(f"[ACK      ] seq={seq} confirmed by gateway "
                           f"(after {attempt} attempt(s))")
                     acked = True
                     break
                 else:
-                    print(f"[COMMAND ] seq={seq} got unexpected frame "
-                          f"(type={parsed['type_name']}, seq={parsed['seq']}), ignoring")
+                    print(f"[COMMAND  ] seq={seq} unexpected or corrupted response, ignoring")
+                    
             except socket.timeout:
-                print(f"[COMMAND ] seq={seq} '{cmd_name}' ACK timeout "
-                      f"({ACK_TIMEOUT}s) - retransmitting" if attempt < MAX_RETRIES
-                      else f"[COMMAND ] seq={seq} '{cmd_name}' ACK timeout - giving up")
-            except (ChecksumMismatchError, InvalidMagicError) as e:
-                print(f"[COMMAND ] seq={seq} received corrupted reply: {e}")
+                if attempt < MAX_RETRIES:
+                    print(f"[COMMAND  ] seq={seq} '{cmd_name}' ACK timeout "
+                          f"({ACK_TIMEOUT}s) - Retransmitting...")
+                else:
+                    print(f"[COMMAND  ] seq={seq} '{cmd_name}' ACK timeout - Giving up")
 
         if not acked:
-            print(f"[COMMAND ] seq={seq} '{cmd_name}' FAILED after {MAX_RETRIES} attempts")
+            print(f"[COMMAND  ] seq={seq} '{cmd_name}' FAILED after {MAX_RETRIES} attempts")
 
         seq += 1
         time.sleep(COMMAND_INTERVAL)
 
-    sock.settimeout(None)
+    sock.close()
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry Point
 # ---------------------------------------------------------------------------
-
 def main():
     print(f"AUV Sender starting -> target gateway {GATEWAY_HOST}:{GATEWAY_PORT}")
     print(f"  telemetry interval : {TELEMETRY_INTERVAL}s")
@@ -134,10 +134,8 @@ def main():
     print(f"  simulated loss rate: {PACKET_LOSS_RATE * 100:.0f}%")
     print("-" * 60)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    t1 = threading.Thread(target=telemetry_loop, args=(sock,), daemon=True)
-    t2 = threading.Thread(target=command_loop, args=(sock,), daemon=True)
+    t1 = threading.Thread(target=telemetry_loop, daemon=True)
+    t2 = threading.Thread(target=command_loop, daemon=True)
     t1.start()
     t2.start()
 
@@ -148,7 +146,6 @@ def main():
         global _running
         _running = False
         print("\nAUV Sender shutting down...")
-        sock.close()
 
 
 if __name__ == "__main__":
