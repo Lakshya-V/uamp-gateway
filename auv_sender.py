@@ -1,6 +1,4 @@
 """
-auv_sender.py
--------------
 Simulates the underwater vehicle (AUV) side of the link.
 
 - Fires TELEMETRY frames continuously over UDP (fast, loss-tolerant).
@@ -13,12 +11,10 @@ import threading
 import time
 import json
 import random
-
 import uamp_protocol as uamp
 
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
+
 GATEWAY_HOST = "127.0.0.1"
 GATEWAY_PORT = 5000  # Matches surface_gateway.py port
 
@@ -38,10 +34,8 @@ COMMANDS = [
 
 _running = True
 
-
-# ---------------------------------------------------------------------------
 # Telemetry Loop — Fire-and-forget UDP
-# ---------------------------------------------------------------------------
+
 def telemetry_loop():
     # Separate socket for telemetry to avoid socket lock contention
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -67,10 +61,7 @@ def telemetry_loop():
         
     sock.close()
 
-
-# ---------------------------------------------------------------------------
 # Command Loop — Reliable Channel (ACK + Retransmission)
-# ---------------------------------------------------------------------------
 def command_loop():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     seq = 100000  # Offset sequence space for commands
@@ -123,10 +114,8 @@ def command_loop():
 
     sock.close()
 
-
-# ---------------------------------------------------------------------------
 # Entry Point
-# ---------------------------------------------------------------------------
+
 def main():
     print(f"AUV Sender starting -> target gateway {GATEWAY_HOST}:{GATEWAY_PORT}")
     print(f"  telemetry interval : {TELEMETRY_INTERVAL}s")
